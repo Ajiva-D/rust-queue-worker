@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use axum::{
@@ -12,6 +13,7 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::{sync::mpsc, time};
 use uuid::Uuid;
 
 #[derive(Serialize, Clone, Copy)]
@@ -29,17 +31,37 @@ struct Job {
     status: JobStatus,
 }
 
-type AppState = Arc<Mutex<HashMap<Uuid, Job>>>;
+#[derive(Clone)]
+struct AppState {
+    jobs: Arc<Mutex<HashMap<Uuid, Job>>>,
+    tx: mpsc::Sender<Uuid>,
+}
 
 #[tokio::main]
 async fn main() {
-    let jobs: AppState = Arc::new(Mutex::new(HashMap::new()));
+    tracing_subscriber::fmt::init();
+
+    let (tx, mut rx) = mpsc::channel::<Uuid>(100);
+
+    let state = AppState {
+        jobs: Arc::new(Mutex::new(HashMap::new())),
+        tx,
+    };
+
+    tokio::spawn(async move {
+        while let Some(id) = rx.recv().await {
+            tracing::info!(job_id = %id, "worker received job");
+            time::sleep(Duration::from_secs(2)).await;
+            tracing::info!(job_id = %id, "job finished");
+        }
+    });
+
     let app = Router::new()
         .route("/", get(handler))
         .route("/health", get(health_handler))
         .route("/jobs", post(create_jobs))
         .route("/jobs/{id}", get(get_single_job))
-        .with_state(jobs);
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
@@ -62,7 +84,9 @@ async fn create_jobs(State(state): State<AppState>) -> (StatusCode, Json<Job>) {
         id,
         status: JobStatus::Queued,
     };
-    state.lock().unwrap().insert(id, new_job);
+    state.jobs.lock().unwrap().insert(id, new_job);
+    state.tx.send(id).await.unwrap();
+    tracing::info!(job_id = %id, "job queued");
 
     (StatusCode::ACCEPTED, Json(new_job))
 }
@@ -71,7 +95,7 @@ async fn get_single_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Job>, StatusCode> {
-    let jobs = state.lock().unwrap();
+    let jobs = state.jobs.lock().unwrap();
     match jobs.get(&id) {
         Some(job) => Ok(Json(*job)),
         None => Err(StatusCode::NOT_FOUND),
