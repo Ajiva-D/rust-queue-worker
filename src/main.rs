@@ -41,20 +41,12 @@ struct AppState {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let (tx, mut rx) = mpsc::channel::<Uuid>(100);
+    let (tx, rx) = mpsc::channel::<Uuid>(100);
 
-    let state = AppState {
-        jobs: Arc::new(Mutex::new(HashMap::new())),
-        tx,
-    };
+    let jobs = Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(worker(rx, jobs.clone()));
 
-    tokio::spawn(async move {
-        while let Some(id) = rx.recv().await {
-            tracing::info!(job_id = %id, "worker received job");
-            time::sleep(Duration::from_secs(2)).await;
-            tracing::info!(job_id = %id, "job finished");
-        }
-    });
+    let state = AppState { jobs, tx };
 
     let app = Router::new()
         .route("/", get(handler))
@@ -84,9 +76,9 @@ async fn create_jobs(State(state): State<AppState>) -> (StatusCode, Json<Job>) {
         id,
         status: JobStatus::Queued,
     };
+    tracing::info!(job_id = %id, "job queued");
     state.jobs.lock().unwrap().insert(id, new_job);
     state.tx.send(id).await.unwrap();
-    tracing::info!(job_id = %id, "job queued");
 
     (StatusCode::ACCEPTED, Json(new_job))
 }
@@ -99,5 +91,38 @@ async fn get_single_job(
     match jobs.get(&id) {
         Some(job) => Ok(Json(*job)),
         None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn worker(mut rx: mpsc::Receiver<Uuid>, jobs: Arc<Mutex<HashMap<Uuid, Job>>>) {
+    while let Some(id) = rx.recv().await {
+        tracing::info!(job_id = %id, "worker received job");
+        {
+            let mut jobs_map = jobs.lock().unwrap();
+            match jobs_map.get_mut(&id) {
+                Some(job) => {
+                    job.status = JobStatus::Processing;
+                    tracing::info!(job_id = %id, "worker is processing job");
+                }
+                None => {
+                    tracing::error!(job_id = %id, "job not found");
+                    continue;
+                }
+            }
+        }
+        time::sleep(Duration::from_secs(30)).await;
+        {
+            let mut jobs_map = jobs.lock().unwrap();
+            match jobs_map.get_mut(&id) {
+                Some(job) => {
+                    job.status = JobStatus::Completed;
+                    tracing::info!(job_id = %id, "job completed");
+                }
+                None => {
+                    tracing::error!(job_id = %id, "job not found");
+                    continue;
+                }
+            }
+        }
     }
 }
